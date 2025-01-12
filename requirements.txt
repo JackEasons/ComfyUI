@@ -1,11 +1,20 @@
 torch
-torchdiffeq
 torchsde
+torchvision
+torchaudio
 einops
-open-clip-torch
-transformers>=4.25.1
-safetensors>=0.3.0
-pytorch_lightning
+transformers>=4.28.1
+tokenizers>=0.13.3
+sentencepiece
+safetensors>=0.4.2
 aiohttp
-accelerate
 pyyaml
+Pillow
+scipy
+tqdm
+psutil
+
+#non essential dependencies:
+kornia>=0.7.1
+spandrel
+soundfile
