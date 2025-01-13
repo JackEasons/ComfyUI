@@ -1,10 +1,10 @@
 #code taken from: https://github.com/wl-zhao/UniPC and modified
 
 import torch
-import torch.nn.functional as F
 import math
+import logging
 
-from tqdm.auto import trange, tqdm
+from tqdm.auto import trange
 
 
 class NoiseScheduleVP:
@@ -16,7 +16,7 @@ class NoiseScheduleVP:
             continuous_beta_0=0.1,
             continuous_beta_1=20.,
         ):
-        """Create a wrapper class for the forward SDE (VP type).
+        r"""Create a wrapper class for the forward SDE (VP type).
 
         ***
         Update: We support discrete-time diffusion models by implementing a picewise linear interpolation for log_alpha_t.
@@ -80,7 +80,7 @@ class NoiseScheduleVP:
                     'linear' or 'cosine' for continuous-time DPMs.
         Returns:
             A wrapper object of the forward SDE (VP type).
-        
+
         ===============================================================
 
         Example:
@@ -180,7 +180,6 @@ class NoiseScheduleVP:
 
 def model_wrapper(
     model,
-    sampling_function,
     noise_schedule,
     model_type="noise",
     model_kwargs={},
@@ -209,7 +208,7 @@ def model_wrapper(
                 arXiv preprint arXiv:2202.00512 (2022).
             [2] Ho, Jonathan, et al. "Imagen Video: High Definition Video Generation with Diffusion Models."
                 arXiv preprint arXiv:2210.02303 (2022).
-    
+
         4. "score": marginal score function. (Trained by denoising score matching).
             Note that the score function and the noise prediction model follows a simple relationship:
             ```
@@ -227,7 +226,7 @@ def model_wrapper(
             The input `model` has the following format:
             ``
                 model(x, t_input, **model_kwargs) -> noise | x_start | v | score
-            `` 
+            ``
 
             The input `classifier_fn` has the following format:
             ``
@@ -241,12 +240,12 @@ def model_wrapper(
             The input `model` has the following format:
             ``
                 model(x, t_input, cond, **model_kwargs) -> noise | x_start | v | score
-            `` 
+            ``
             And if cond == `unconditional_condition`, the model output is the unconditional DPM output.
 
             [4] Ho, Jonathan, and Tim Salimans. "Classifier-free diffusion guidance."
                 arXiv preprint arXiv:2207.12598 (2022).
-        
+
 
     The `t_input` is the time label of the model, which may be discrete-time labels (i.e. 0 to 999)
     or continuous-time labels (i.e. epsilon to T).
@@ -255,7 +254,7 @@ def model_wrapper(
     ``
         def model_fn(x, t_continuous) -> noise:
             t_input = get_model_input_time(t_continuous)
-            return noise_pred(model, x, t_input, **model_kwargs)         
+            return noise_pred(model, x, t_input, **model_kwargs)
     ``
     where `t_continuous` is the continuous time labels (i.e. epsilon to T). And we use `model_fn` for DPM-Solver.
 
@@ -295,7 +294,7 @@ def model_wrapper(
         if t_continuous.reshape((-1,)).shape[0] == 1:
             t_continuous = t_continuous.expand((x.shape[0]))
         t_input = get_model_input_time(t_continuous)
-        output = sampling_function(model, x, t_input, **model_kwargs)
+        output = model(x, t_input, **model_kwargs)
         if model_type == "noise":
             return output
         elif model_type == "x_start":
@@ -359,11 +358,8 @@ class UniPC:
         thresholding=False,
         max_val=1.,
         variant='bh1',
-        noise_mask=None,
-        masked_image=None,
-        noise=None,
     ):
-        """Construct a UniPC. 
+        """Construct a UniPC.
 
         We support both data_prediction and noise_prediction.
         """
@@ -373,13 +369,10 @@ class UniPC:
         self.predict_x0 = predict_x0
         self.thresholding = thresholding
         self.max_val = max_val
-        self.noise_mask = noise_mask
-        self.masked_image = masked_image
-        self.noise = noise
 
     def dynamic_thresholding_fn(self, x0, t=None):
         """
-        The dynamic thresholding method. 
+        The dynamic thresholding method.
         """
         dims = x0.dim()
         p = self.dynamic_thresholding_ratio
@@ -392,10 +385,7 @@ class UniPC:
         """
         Return the noise prediction model.
         """
-        if self.noise_mask is not None:
-            return self.model(x, t) * self.noise_mask
-        else:
-            return self.model(x, t)
+        return self.model(x, t)
 
     def data_prediction_fn(self, x, t):
         """
@@ -410,13 +400,11 @@ class UniPC:
             s = torch.quantile(torch.abs(x0).reshape((x0.shape[0], -1)), p, dim=1)
             s = expand_dims(torch.maximum(s, self.max_val * torch.ones_like(s).to(s.device)), dims)
             x0 = torch.clamp(x0, -s, s) / s
-        if self.noise_mask is not None:
-            x0 = x0 * self.noise_mask + (1. - self.noise_mask) * self.masked_image
         return x0
 
     def model_fn(self, x, t):
         """
-        Convert the model to the noise prediction model or the data prediction model. 
+        Convert the model to the noise prediction model or the data prediction model.
         """
         if self.predict_x0:
             return self.data_prediction_fn(x, t)
@@ -473,7 +461,7 @@ class UniPC:
 
     def denoise_to_zero_fn(self, x, s):
         """
-        Denoise at the final step, which is equivalent to solve the ODE from lambda_s to infty by first-order discretization. 
+        Denoise at the final step, which is equivalent to solve the ODE from lambda_s to infty by first-order discretization.
         """
         return self.data_prediction_fn(x, s)
 
@@ -487,7 +475,7 @@ class UniPC:
             return self.multistep_uni_pc_vary_update(x, model_prev_list, t_prev_list, t, order, **kwargs)
 
     def multistep_uni_pc_vary_update(self, x, model_prev_list, t_prev_list, t, order, use_corrector=True):
-        print(f'using unified predictor-corrector with order {order} (solver type: vary coeff)')
+        logging.info(f'using unified predictor-corrector with order {order} (solver type: vary coeff)')
         ns = self.noise_schedule
         assert order <= len(model_prev_list)
 
@@ -522,7 +510,7 @@ class UniPC:
         col = torch.ones_like(rks)
         for k in range(1, K + 1):
             C.append(col)
-            col = col * rks / (k + 1) 
+            col = col * rks / (k + 1)
         C = torch.stack(C, dim=1)
 
         if len(D1s) > 0:
@@ -531,7 +519,6 @@ class UniPC:
             A_p = C_inv_p
 
         if use_corrector:
-            print('using corrector')
             C_inv = torch.linalg.inv(C)
             A_c = C_inv
 
@@ -634,12 +621,12 @@ class UniPC:
             B_h = torch.expm1(hh)
         else:
             raise NotImplementedError()
-            
+
         for i in range(1, order + 1):
             R.append(torch.pow(rks, i - 1))
             b.append(h_phi_k * factorial_i / B_h)
             factorial_i *= (i + 1)
-            h_phi_k = h_phi_k / hh - 1 / factorial_i 
+            h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
         b = torch.tensor(b, device=x.device)
@@ -689,7 +676,7 @@ class UniPC:
                 x_t = x_t_ - expand_dims(alpha_t * B_h, dims) * (corr_res + rhos_c[-1] * D1_t)
         else:
             x_t_ = (
-                expand_dims(torch.exp(log_alpha_t - log_alpha_prev_0), dimss) * x
+                expand_dims(torch.exp(log_alpha_t - log_alpha_prev_0), dims) * x
                 - expand_dims(sigma_t * h_phi_1, dims) * model_prev_0
             )
             if x_t is None:
@@ -712,20 +699,17 @@ class UniPC:
 
     def sample(self, x, timesteps, t_start=None, t_end=None, order=3, skip_type='time_uniform',
         method='singlestep', lower_order_final=True, denoise_to_zero=False, solver_type='dpm_solver',
-        atol=0.0078, rtol=0.05, corrector=False,
+        atol=0.0078, rtol=0.05, corrector=False, callback=None, disable_pbar=False
     ):
-        t_0 = 1. / self.noise_schedule.total_N if t_end is None else t_end
-        t_T = self.noise_schedule.T if t_start is None else t_start
-        device = x.device
+        # t_0 = 1. / self.noise_schedule.total_N if t_end is None else t_end
+        # t_T = self.noise_schedule.T if t_start is None else t_start
         steps = len(timesteps) - 1
         if method == 'multistep':
             assert steps >= order
             # timesteps = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=steps, device=device)
             assert timesteps.shape[0] - 1 == steps
             # with torch.no_grad():
-            for step_index in trange(steps):
-                if self.noise_mask is not None:
-                    x = x * self.noise_mask + (1. - self.noise_mask) * (self.masked_image * self.noise_schedule.marginal_alpha(timesteps[step_index]) + self.noise * self.noise_schedule.marginal_std(timesteps[step_index]))
+            for step_index in trange(steps, disable=disable_pbar):
                 if step_index == 0:
                     vec_t = timesteps[0].expand((x.shape[0]))
                     model_prev_list = [self.model_fn(x, vec_t)]
@@ -766,10 +750,12 @@ class UniPC:
                             if model_x is None:
                                 model_x = self.model_fn(x, vec_t)
                             model_prev_list[-1] = model_x
+                if callback is not None:
+                    callback({'x': x, 'i': step_index, 'denoised': model_prev_list[-1]})
         else:
             raise NotImplementedError()
-        if denoise_to_zero:
-            x = self.denoise_to_zero_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)
+        # if denoise_to_zero:
+        #     x = self.denoise_to_zero_fn(x, torch.ones((x.shape[0],)).to(device) * t_0)
         return x
 
 
@@ -832,52 +818,56 @@ def expand_dims(v, dims):
     return v[(...,) + (None,)*(dims - 1)]
 
 
+class SigmaConvert:
+    schedule = ""
+    def marginal_log_mean_coeff(self, sigma):
+        return 0.5 * torch.log(1 / ((sigma * sigma) + 1))
 
-def sample_unipc(model, noise, image, sigmas, sampling_function, max_denoise, extra_args=None, callback=None, disable=None, noise_mask=None, variant='bh1'):
-        to_zero = False
+    def marginal_alpha(self, t):
+        return torch.exp(self.marginal_log_mean_coeff(t))
+
+    def marginal_std(self, t):
+        return torch.sqrt(1. - torch.exp(2. * self.marginal_log_mean_coeff(t)))
+
+    def marginal_lambda(self, t):
+        """
+        Compute lambda_t = log(alpha_t) - log(sigma_t) of a given continuous-time label t in [0, T].
+        """
+        log_mean_coeff = self.marginal_log_mean_coeff(t)
+        log_std = 0.5 * torch.log(1. - torch.exp(2. * log_mean_coeff))
+        return log_mean_coeff - log_std
+
+def predict_eps_sigma(model, input, sigma_in, **kwargs):
+    sigma = sigma_in.view(sigma_in.shape[:1] + (1,) * (input.ndim - 1))
+    input = input * ((sigma ** 2 + 1.0) ** 0.5)
+    return  (input - model(input, sigma_in, **kwargs)) / sigma
+
+
+def sample_unipc(model, noise, sigmas, extra_args=None, callback=None, disable=False, variant='bh1'):
+        timesteps = sigmas.clone()
         if sigmas[-1] == 0:
-            timesteps = torch.nn.functional.interpolate(sigmas[None,None,:-1], size=(len(sigmas),), mode='linear')[0][0]
-            to_zero = True
+            timesteps = sigmas[:]
+            timesteps[-1] = 0.001
         else:
             timesteps = sigmas.clone()
+        ns = SigmaConvert()
 
-        for s in range(timesteps.shape[0]):
-            timesteps[s] = (model.sigma_to_t(timesteps[s]) / 1000) + (1 / len(model.sigmas))
-
-        ns = NoiseScheduleVP('discrete', alphas_cumprod=model.inner_model.alphas_cumprod)
-
-        if image is not None:
-            img = image * ns.marginal_alpha(timesteps[0])
-            if max_denoise:
-                noise_mult = 1.0
-            else:
-                noise_mult = ns.marginal_std(timesteps[0])
-            img += noise * noise_mult
-        else:
-            img = noise
-
-        if to_zero:
-            timesteps[-1] = (1 / len(model.sigmas))
-
-        device = noise.device
-
-        if model.parameterization == "v":
-            model_type = "v"
-        else:
-            model_type = "noise"
+        noise = noise / torch.sqrt(1.0 + timesteps[0] ** 2.0)
+        model_type = "noise"
 
         model_fn = model_wrapper(
-            model.inner_model.inner_model.apply_model,
-            sampling_function,
+            lambda input, sigma, **kwargs: predict_eps_sigma(model, input, sigma, **kwargs),
             ns,
             model_type=model_type,
             guidance_type="uncond",
             model_kwargs=extra_args,
         )
 
-        order = min(3, len(timesteps) - 1)
-        uni_pc = UniPC(model_fn, ns, predict_x0=True, thresholding=False, noise_mask=noise_mask, masked_image=image, noise=noise, variant=variant)
-        x = uni_pc.sample(img, timesteps=timesteps, skip_type="time_uniform", method="multistep", order=order, lower_order_final=True)
-        if not to_zero:
-            x /= ns.marginal_alpha(timesteps[-1])
+        order = min(3, len(timesteps) - 2)
+        uni_pc = UniPC(model_fn, ns, predict_x0=True, thresholding=False, variant=variant)
+        x = uni_pc.sample(noise, timesteps=timesteps, skip_type="time_uniform", method="multistep", order=order, lower_order_final=True, callback=callback, disable_pbar=disable)
+        x /= ns.marginal_alpha(timesteps[-1])
         return x
+
+def sample_unipc_bh2(model, noise, sigmas, extra_args=None, callback=None, disable=False):
+    return sample_unipc(model, noise, sigmas, extra_args, callback, disable, variant='bh2')

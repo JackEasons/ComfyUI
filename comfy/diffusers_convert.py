@@ -1,14 +1,6 @@
-import json
-import os
-import yaml
-
-import folder_paths
-from comfy.ldm.util import instantiate_from_config
-from comfy.sd import ModelPatcher, load_model_weights, CLIP, VAE
-import os.path as osp
 import re
 import torch
-from safetensors.torch import load_file, save_file
+import logging
 
 # conversion code from https://github.com/huggingface/diffusers/blob/main/scripts/convert_diffusers_to_original_stable_diffusion.py
 
@@ -157,20 +149,31 @@ vae_conversion_map_attn = [
     ("q.", "query."),
     ("k.", "key."),
     ("v.", "value."),
+    ("q.", "to_q."),
+    ("k.", "to_k."),
+    ("v.", "to_v."),
+    ("proj_out.", "to_out.0."),
     ("proj_out.", "proj_attn."),
 ]
 
 
-def reshape_weight_for_sd(w):
+def reshape_weight_for_sd(w, conv3d=False):
     # convert HF linear weights to SD conv2d weights
-    return w.reshape(*w.shape, 1, 1)
+    if conv3d:
+        return w.reshape(*w.shape, 1, 1, 1)
+    else:
+        return w.reshape(*w.shape, 1, 1)
 
 
 def convert_vae_state_dict(vae_state_dict):
     mapping = {k: k for k in vae_state_dict.keys()}
+    conv3d = False
     for k, v in mapping.items():
         for sd_part, hf_part in vae_conversion_map:
             v = v.replace(hf_part, sd_part)
+        if v.endswith(".conv.weight"):
+            if not conv3d and vae_state_dict[k].ndim == 5:
+                conv3d = True
         mapping[k] = v
     for k, v in mapping.items():
         if "attentions" in k:
@@ -182,8 +185,8 @@ def convert_vae_state_dict(vae_state_dict):
     for k, v in new_state_dict.items():
         for weight_name in weights_to_convert:
             if f"mid.attn_1.{weight_name}.weight" in k:
-                print(f"Reshaping {k} for SD format")
-                new_state_dict[k] = reshape_weight_for_sd(v)
+                logging.debug(f"Reshaping {k} for SD format")
+                new_state_dict[k] = reshape_weight_for_sd(v, conv3d=conv3d)
     return new_state_dict
 
 
@@ -210,12 +213,29 @@ textenc_pattern = re.compile("|".join(protected.keys()))
 # Ordering is from https://github.com/pytorch/pytorch/blob/master/test/cpp/api/modules.cpp
 code2idx = {"q": 0, "k": 1, "v": 2}
 
+# This function exists because at the time of writing torch.cat can't do fp8 with cuda
+def cat_tensors(tensors):
+    x = 0
+    for t in tensors:
+        x += t.shape[0]
 
-def convert_text_enc_state_dict_v20(text_enc_dict):
+    shape = [x] + list(tensors[0].shape)[1:]
+    out = torch.empty(shape, device=tensors[0].device, dtype=tensors[0].dtype)
+
+    x = 0
+    for t in tensors:
+        out[x:x + t.shape[0]] = t
+        x += t.shape[0]
+
+    return out
+
+def convert_text_enc_state_dict_v20(text_enc_dict, prefix=""):
     new_state_dict = {}
     capture_qkv_weight = {}
     capture_qkv_bias = {}
     for k, v in text_enc_dict.items():
+        if not k.startswith(prefix):
+            continue
         if (
                 k.endswith(".self_attn.q_proj.weight")
                 or k.endswith(".self_attn.k_proj.weight")
@@ -240,20 +260,24 @@ def convert_text_enc_state_dict_v20(text_enc_dict):
             capture_qkv_bias[k_pre][code2idx[k_code]] = v
             continue
 
-        relabelled_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], k)
-        new_state_dict[relabelled_key] = v
+        text_proj = "transformer.text_projection.weight"
+        if k.endswith(text_proj):
+            new_state_dict[k.replace(text_proj, "text_projection")] = v.transpose(0, 1).contiguous()
+        else:
+            relabelled_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], k)
+            new_state_dict[relabelled_key] = v
 
     for k_pre, tensors in capture_qkv_weight.items():
         if None in tensors:
             raise Exception("CORRUPTED MODEL: one of the q-k-v values for the text encoder was missing")
         relabelled_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], k_pre)
-        new_state_dict[relabelled_key + ".in_proj_weight"] = torch.cat(tensors)
+        new_state_dict[relabelled_key + ".in_proj_weight"] = cat_tensors(tensors)
 
     for k_pre, tensors in capture_qkv_bias.items():
         if None in tensors:
             raise Exception("CORRUPTED MODEL: one of the q-k-v values for the text encoder was missing")
         relabelled_key = textenc_pattern.sub(lambda m: protected[re.escape(m.group(0))], k_pre)
-        new_state_dict[relabelled_key + ".in_proj_bias"] = torch.cat(tensors)
+        new_state_dict[relabelled_key + ".in_proj_bias"] = cat_tensors(tensors)
 
     return new_state_dict
 
@@ -262,101 +286,3 @@ def convert_text_enc_state_dict(text_enc_dict):
     return text_enc_dict
 
 
-def load_diffusers(model_path, fp16=True, output_vae=True, output_clip=True, embedding_directory=None):
-    diffusers_unet_conf = json.load(open(osp.join(model_path, "unet/config.json")))
-    diffusers_scheduler_conf = json.load(open(osp.join(model_path, "scheduler/scheduler_config.json")))
-
-    # magic
-    v2 = diffusers_unet_conf["sample_size"] == 96
-    if 'prediction_type' in diffusers_scheduler_conf:
-        v_pred = diffusers_scheduler_conf['prediction_type'] == 'v_prediction'
-
-    if v2:
-        if v_pred:
-            config_path = folder_paths.get_full_path("configs", 'v2-inference-v.yaml')
-        else:
-            config_path = folder_paths.get_full_path("configs", 'v2-inference.yaml')
-    else:
-        config_path = folder_paths.get_full_path("configs", 'v1-inference.yaml')
-
-    with open(config_path, 'r') as stream:
-        config = yaml.safe_load(stream)
-
-    model_config_params = config['model']['params']
-    clip_config = model_config_params['cond_stage_config']
-    scale_factor = model_config_params['scale_factor']
-    vae_config = model_config_params['first_stage_config']
-    vae_config['scale_factor'] = scale_factor
-    model_config_params["unet_config"]["params"]["use_fp16"] = fp16
-
-    unet_path = osp.join(model_path, "unet", "diffusion_pytorch_model.safetensors")
-    vae_path = osp.join(model_path, "vae", "diffusion_pytorch_model.safetensors")
-    text_enc_path = osp.join(model_path, "text_encoder", "model.safetensors")
-
-    # Load models from safetensors if it exists, if it doesn't pytorch
-    if osp.exists(unet_path):
-        unet_state_dict = load_file(unet_path, device="cpu")
-    else:
-        unet_path = osp.join(model_path, "unet", "diffusion_pytorch_model.bin")
-        unet_state_dict = torch.load(unet_path, map_location="cpu")
-
-    if osp.exists(vae_path):
-        vae_state_dict = load_file(vae_path, device="cpu")
-    else:
-        vae_path = osp.join(model_path, "vae", "diffusion_pytorch_model.bin")
-        vae_state_dict = torch.load(vae_path, map_location="cpu")
-
-    if osp.exists(text_enc_path):
-        text_enc_dict = load_file(text_enc_path, device="cpu")
-    else:
-        text_enc_path = osp.join(model_path, "text_encoder", "pytorch_model.bin")
-        text_enc_dict = torch.load(text_enc_path, map_location="cpu")
-
-    # Convert the UNet model
-    unet_state_dict = convert_unet_state_dict(unet_state_dict)
-    unet_state_dict = {"model.diffusion_model." + k: v for k, v in unet_state_dict.items()}
-
-    # Convert the VAE model
-    vae_state_dict = convert_vae_state_dict(vae_state_dict)
-    vae_state_dict = {"first_stage_model." + k: v for k, v in vae_state_dict.items()}
-
-    # Easiest way to identify v2.0 model seems to be that the text encoder (OpenCLIP) is deeper
-    is_v20_model = "text_model.encoder.layers.22.layer_norm2.bias" in text_enc_dict
-
-    if is_v20_model:
-        # Need to add the tag 'transformer' in advance so we can knock it out from the final layer-norm
-        text_enc_dict = {"transformer." + k: v for k, v in text_enc_dict.items()}
-        text_enc_dict = convert_text_enc_state_dict_v20(text_enc_dict)
-        text_enc_dict = {"cond_stage_model.model." + k: v for k, v in text_enc_dict.items()}
-    else:
-        text_enc_dict = convert_text_enc_state_dict(text_enc_dict)
-        text_enc_dict = {"cond_stage_model.transformer." + k: v for k, v in text_enc_dict.items()}
-
-    # Put together new checkpoint
-    sd = {**unet_state_dict, **vae_state_dict, **text_enc_dict}
-
-    clip = None
-    vae = None
-
-    class WeightsLoader(torch.nn.Module):
-        pass
-
-    w = WeightsLoader()
-    load_state_dict_to = []
-    if output_vae:
-        vae = VAE(scale_factor=scale_factor, config=vae_config)
-        w.first_stage_model = vae.first_stage_model
-        load_state_dict_to = [w]
-
-    if output_clip:
-        clip = CLIP(config=clip_config, embedding_directory=embedding_directory)
-        w.cond_stage_model = clip.cond_stage_model
-        load_state_dict_to = [w]
-
-    model = instantiate_from_config(config["model"])
-    model = load_model_weights(model, sd, verbose=False, load_state_dict_to=load_state_dict_to)
-
-    if fp16:
-        model = model.half()
-
-    return ModelPatcher(model), clip, vae
